@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Working directories created by scripts
+work_*/
+work_chestxray14/
+work_chexpert/
+work_rsna_pneumonia/
+work_ham10000/
+work_isic/
+work_brats/
+work_busi/
+work_covid19/
+work_oct/
+work_luna16/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
