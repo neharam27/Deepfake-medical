@@ -379,51 +379,101 @@ print("=" * 70)
 print("STEP 4: FINAL EVALUATION ON TEST SET")
 print("=" * 70)
 
-detector.load_state_dict(torch.load(os.path.join(MODELS_DIR, "best_detector.pt"), map_location=DEVICE))
+det_path = os.path.join(MODELS_DIR, "best_detector.pt")
+if not os.path.isfile(det_path):
+    sys.exit(f"[ERROR] Detector model not found: {det_path}")
+detector.load_state_dict(torch.load(det_path, map_location=DEVICE))
 detector.eval()
+print(f"✓ Detector loaded from {det_path}")
 
+# --- Load real test images ---
+print("Loading real test images...")
 test_images, test_labels = [], []
-for f in sorted(os.listdir(TEST_DIR)):
-    if f.lower().endswith(".png"):
-        img = cv2.imread(os.path.join(TEST_DIR, f), cv2.IMREAD_GRAYSCALE)
+skipped_real = 0
+real_files = sorted([f for f in os.listdir(TEST_DIR) if f.lower().endswith(".png")])
+for f in real_files:
+    fpath = os.path.join(TEST_DIR, f)
+    try:
+        img = cv2.imread(fpath, cv2.IMREAD_GRAYSCALE)
         if img is None:
+            print(f"  [WARN] Could not read real image: {f}")
+            skipped_real += 1
             continue
         img = cv2.resize(img, (IMG_SIZE_DET, IMG_SIZE_DET))
         img = img.astype(np.float32) / 255.0
         test_images.append(torch.from_numpy(img).unsqueeze(0))
         test_labels.append(0)
+    except Exception as e:
+        print(f"  [WARN] Error loading real image {f}: {e}")
+        skipped_real += 1
+print(f"  Loaded {len(test_labels)} real images (skipped {skipped_real})")
 
-for f in sorted(os.listdir(FAKES_TEST)):
-    if f.lower().endswith(".png"):
-        img = cv2.imread(os.path.join(FAKES_TEST, f), cv2.IMREAD_GRAYSCALE)
+# --- Load fake test images ---
+print("Loading fake test images...")
+skipped_fake = 0
+fake_files = sorted([f for f in os.listdir(FAKES_TEST) if f.lower().endswith(".png")])
+for f in fake_files:
+    fpath = os.path.join(FAKES_TEST, f)
+    try:
+        img = cv2.imread(fpath, cv2.IMREAD_GRAYSCALE)
         if img is None:
+            print(f"  [WARN] Could not read fake image: {f}")
+            skipped_fake += 1
             continue
         img = cv2.resize(img, (IMG_SIZE_DET, IMG_SIZE_DET))
         img = img.astype(np.float32) / 255.0
         test_images.append(torch.from_numpy(img).unsqueeze(0))
         test_labels.append(1)
+    except Exception as e:
+        print(f"  [WARN] Error loading fake image {f}: {e}")
+        skipped_fake += 1
+n_real = test_labels.count(0)
+n_fake = test_labels.count(1)
+print(f"  Loaded {n_fake} fake images (skipped {skipped_fake})")
+print(f"Total test images: {len(test_images)} ({n_real} real + {n_fake} fake)")
 
-all_preds, all_probs = [], []
+if len(test_images) == 0:
+    sys.exit("[ERROR] No test images were loaded. Cannot run evaluation.")
+
+# --- Run inference ---
+print("Running inference on test set...")
+all_preds, all_probs, all_labels = [], [], []
+n_batches = (len(test_images) + BATCH_SIZE - 1) // BATCH_SIZE
 with torch.no_grad():
-    for i in tqdm(range(0, len(test_images), BATCH_SIZE), desc="Inference"):
-        batch  = torch.stack(test_images[i:i+BATCH_SIZE]).to(DEVICE)
-        logits = detector(batch)
-        probs  = torch.softmax(logits, 1)
-        preds  = torch.argmax(logits, 1)
-        all_preds.extend(preds.cpu().numpy())
-        all_probs.extend(probs[:, 1].cpu().numpy())
+    for i in tqdm(range(0, len(test_images), BATCH_SIZE), desc="Inference", total=n_batches):
+        try:
+            batch_tensors = test_images[i:i + BATCH_SIZE]
+            batch_labels  = test_labels[i:i + BATCH_SIZE]
+            batch = torch.stack(batch_tensors).to(DEVICE)
+            logits = detector(batch)
+            probs  = torch.softmax(logits, 1)
+            preds  = torch.argmax(logits, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
+            all_labels.extend(batch_labels)
+        except Exception as e:
+            print(f"  [WARN] Batch {i // BATCH_SIZE + 1}/{n_batches} failed: {e}")
+            continue
 
-all_labels = np.array(test_labels)
+if len(all_preds) == 0:
+    sys.exit("[ERROR] Inference produced no predictions. Cannot compute metrics.")
+
+all_labels = np.array(all_labels)
 all_preds  = np.array(all_preds)
 all_probs  = np.array(all_probs)
+print(f"✓ Inference complete: {len(all_preds)} predictions")
 
+# --- Compute metrics ---
+print("Computing metrics...")
 accuracy  = accuracy_score(all_labels, all_preds)
 precision = precision_score(all_labels, all_preds, zero_division=0)
 recall    = recall_score(all_labels, all_preds, zero_division=0)
 f1        = f1_score(all_labels, all_preds, zero_division=0)
-auc       = roc_auc_score(all_labels, all_probs)
-cm        = confusion_matrix(all_labels, all_preds)
-tn, fp, fn, tp = cm.ravel()
+try:
+    auc = roc_auc_score(all_labels, all_probs)
+except ValueError as e:
+    print(f"  [WARN] AUC could not be computed: {e}")
+    auc = float("nan")
 
 print("\n" + "=" * 70)
 print(f"DATASET : {DATASET_NAME}")
@@ -434,36 +484,57 @@ print(f"Precision : {precision:.4f}")
 print(f"Recall    : {recall:.4f}")
 print(f"F1 Score  : {f1:.4f}")
 print(f"AUC       : {auc:.4f}")
-print(f"TP={tp}  TN={tn}  FP={fp}  FN={fn}")
+
+# --- Confusion matrix ---
+print("Generating confusion matrix...")
+try:
+    cm = confusion_matrix(all_labels, all_preds)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        print(f"TP={tp}  TN={tn}  FP={fp}  FN={fn}")
+    else:
+        print(f"  [WARN] Unexpected confusion matrix shape: {cm.shape}")
+        tn = fp = fn = tp = 0
+except Exception as e:
+    print(f"  [ERROR] Confusion matrix calculation failed: {e}")
+    cm = np.zeros((2, 2), dtype=int)
+    tn = fp = fn = tp = 0
 
 # Save confusion matrix CSV
 csv_path = os.path.join(OUTPUT_DIR, f"confusion_matrix_{DATASET_NAME}.csv")
-with open(csv_path, "w", newline="") as fh:
-    writer = csv.writer(fh)
-    writer.writerow(["", "Predicted Real", "Predicted Fake"])
-    writer.writerow(["Actual Real", tn, fp])
-    writer.writerow(["Actual Fake", fn, tp])
-print(f"✓ CSV  → {csv_path}")
+try:
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["", "Predicted Real", "Predicted Fake"])
+        writer.writerow(["Actual Real", tn, fp])
+        writer.writerow(["Actual Fake", fn, tp])
+    print(f"✓ CSV  → {csv_path}")
+except Exception as e:
+    print(f"  [ERROR] Failed to save CSV: {e}")
 
 # Save confusion matrix PNG
-fig, ax = plt.subplots(figsize=(6, 5))
-im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-plt.colorbar(im, ax=ax)
-ax.set(
-    xticks=[0, 1], yticks=[0, 1],
-    xticklabels=["Real", "Fake"], yticklabels=["Real", "Fake"],
-    ylabel="True label", xlabel="Predicted label",
-    title=f"Confusion Matrix – {DATASET_NAME}",
-)
-thresh = cm.max() / 2.0
-for r in range(2):
-    for c in range(2):
-        ax.text(c, r, format(cm[r, c], "d"),
-                ha="center", va="center",
-                color="white" if cm[r, c] > thresh else "black")
-plt.tight_layout()
 png_path = os.path.join(OUTPUT_DIR, f"confusion_matrix_{DATASET_NAME}.png")
-plt.savefig(png_path, dpi=150)
-plt.close()
-print(f"✓ PNG  → {png_path}")
+try:
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    plt.colorbar(im, ax=ax)
+    ax.set(
+        xticks=[0, 1], yticks=[0, 1],
+        xticklabels=["Real", "Fake"], yticklabels=["Real", "Fake"],
+        ylabel="True label", xlabel="Predicted label",
+        title=f"Confusion Matrix – {DATASET_NAME}",
+    )
+    thresh = cm.max() / 2.0
+    for r in range(2):
+        for c in range(2):
+            ax.text(c, r, format(cm[r, c], "d"),
+                    ha="center", va="center",
+                    color="white" if cm[r, c] > thresh else "black")
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+    print(f"✓ PNG  → {png_path}")
+except Exception as e:
+    print(f"  [ERROR] Failed to save PNG: {e}")
+
 print("\nPipeline complete.")
