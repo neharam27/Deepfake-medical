@@ -1,16 +1,10 @@
 """
 script_1_chestxray14.py
-Leakage-free deepfake detection pipeline applied to ChestX-ray14 dataset.
+Leakage-free deepfake detection pipeline applied to ChestMNIST dataset.
 
-Dataset: NIH ChestX-ray14
-  - Images: PNG files in images/ folder (or images_001/, images_002/, etc.)
-  - Metadata: Data_Entry_2017.csv (Image Index, Finding Labels, ...)
-
-Before running, set DATA_PATH to the root of your ChestX-ray14 download.
-Expected layout:
-  DATA_PATH/
-    images/          (or images_001/, images_002/, ... sub-folders)
-    Data_Entry_2017.csv   (optional – used only for stratification hint)
+Dataset: ChestMNIST (medmnist) – automatically downloaded at runtime.
+  - 28×28 chest X-ray images upsampled to 64×64 (GAN) and 256×256 (detector)
+  - Data augmentation applied to recover lost spatial detail
 
 Output files (written next to this script or in OUTPUT_DIR):
   confusion_matrix_chestxray14.csv
@@ -21,7 +15,6 @@ Output files (written next to this script or in OUTPUT_DIR):
 # IMPORTS
 # ============================================================
 import os
-import sys
 import random
 import csv
 
@@ -43,15 +36,10 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 # ============================================================
-# USER CONFIGURATION  –  edit these paths
-# ============================================================
-DATA_PATH   = os.environ.get("CHESTXRAY14_PATH", "./chestxray14_data")
-OUTPUT_DIR  = "."          # where confusion matrix files are saved
-WORK_DIR    = "./work_chestxray14"   # working directory for split images / fakes
-
-# ============================================================
 # PIPELINE CONSTANTS  (do NOT change)
 # ============================================================
+OUTPUT_DIR   = "."                   # where confusion matrix files are saved
+WORK_DIR     = "./work_chestxray14"  # working directory for split images / fakes
 DATASET_NAME = "chestxray14"
 IMG_SIZE_GAN  = 64
 IMG_SIZE_DET  = 256
@@ -70,6 +58,7 @@ torch.manual_seed(RANDOM_STATE)
 
 # Derived paths
 DATASET_DIR   = os.path.join(WORK_DIR, "datasets")
+RAW_DIR       = os.path.join(DATASET_DIR, "raw")
 TRAIN_DIR     = os.path.join(DATASET_DIR, "train")
 VAL_DIR       = os.path.join(DATASET_DIR, "val")
 TEST_DIR      = os.path.join(DATASET_DIR, "test")
@@ -79,64 +68,217 @@ FAKES_TEST    = os.path.join(FAKES_DIR, "test")
 MODELS_DIR    = os.path.join(WORK_DIR, "models")
 CKPT_DIR      = os.path.join(WORK_DIR, "checkpoints")
 
-for d in [TRAIN_DIR, VAL_DIR, TEST_DIR, FAKES_VAL, FAKES_TEST, MODELS_DIR, CKPT_DIR]:
+for d in [RAW_DIR, TRAIN_DIR, VAL_DIR, TEST_DIR, FAKES_VAL, FAKES_TEST, MODELS_DIR, CKPT_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # ============================================================
-# STEP 0 – Load & split ChestX-ray14 images (60/20/20)
+# STEP 0 – Download ChestMNIST and split (60/20/20)
 # ============================================================
-print("=" * 70)
-print("STEP 0: DATA LOADING & SPLITTING (ChestX-ray14)")
-print("=" * 70)
+print("=" * 80)
+print("STEP 0: PROPER DATA SPLITTING (NO LEAKAGE)")
+print("=" * 80)
 
-def collect_chestxray14_images(data_path):
-    """Collect all .png image paths from ChestX-ray14 directory tree."""
-    candidates = []
-    # Support flat images/ or numbered sub-folders images_001/ etc.
-    for root, _dirs, files in os.walk(data_path):
-        for fname in files:
-            if fname.lower().endswith(".png"):
-                candidates.append(os.path.join(root, fname))
-    return sorted(candidates)
+print("""
+DATA SPLIT STRATEGY:
+  Train (60%): Only for GAN training
+  Val   (20%): For detector training (real val + GAN-generated val fakes)
+  Test  (20%): For evaluation (real test + GAN-generated test fakes)
 
-all_paths = collect_chestxray14_images(DATA_PATH)
+This ensures ZERO overlap between datasets.
+""")
 
-if len(all_paths) == 0:
-    sys.exit(
-        f"[ERROR] No PNG images found under DATA_PATH='{DATA_PATH}'.\n"
-        "Please set DATA_PATH to the root of your ChestX-ray14 download."
-    )
+# ----------------------------------------------------------------
+# [1/4] Download raw data
+# ----------------------------------------------------------------
+print("[1/4] Downloading ChestMNIST dataset...")
 
-print(f"Found {len(all_paths)} images")
+try:
+    import medmnist
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "medmnist"])
+    import medmnist
 
-indices = np.arange(len(all_paths))
+from medmnist import ChestMNIST
+
+train_dataset = ChestMNIST(split="train", download=True, root=RAW_DIR)
+test_dataset  = ChestMNIST(split="test",  download=True, root=RAW_DIR)
+
+print(f"✓ Downloaded {len(train_dataset)} train + {len(test_dataset)} test images")
+
+# ----------------------------------------------------------------
+# [2/4] Extract and save raw data
+# ----------------------------------------------------------------
+print("\n[2/4] Extracting and organizing raw data...")
+
+RAW_TRAIN_DIR = os.path.join(RAW_DIR, "train_raw")
+RAW_TEST_DIR  = os.path.join(RAW_DIR, "test_raw")
+
+
+def save_dataset_raw(dataset, output_dir, prefix):
+    """Save dataset images to directory at original 28×28 size."""
+    os.makedirs(output_dir, exist_ok=True)
+    for idx in tqdm(range(len(dataset)), desc=f"Saving {prefix}"):
+        img, _label = dataset[idx]
+        img_np = np.array(img)
+        # Collapse channel dim to grayscale
+        if img_np.ndim == 3:
+            if img_np.shape[0] == 1:
+                img_np = img_np[0]
+            elif img_np.shape[0] == 3:
+                img_np = cv2.cvtColor(img_np.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
+        # Ensure uint8 [0, 255]
+        if img_np.max() <= 1.0:
+            img_np = (img_np * 255).astype(np.uint8)
+        else:
+            img_np = img_np.astype(np.uint8)
+        cv2.imwrite(os.path.join(output_dir, f"{prefix}_{idx:05d}.png"), img_np)
+
+
+save_dataset_raw(train_dataset, RAW_TRAIN_DIR, "train")
+save_dataset_raw(test_dataset,  RAW_TEST_DIR,  "test")
+print("✓ Raw data saved")
+
+# ----------------------------------------------------------------
+# [3/4] Combine all images and create 60/20/20 split
+# ----------------------------------------------------------------
+print("\n[3/4] Performing train/val/test split (60/20/20)...")
+
+all_image_paths = []
+for src_dir in [RAW_TRAIN_DIR, RAW_TEST_DIR]:
+    for fname in sorted(os.listdir(src_dir)):
+        if fname.endswith(".png"):
+            all_image_paths.append(os.path.join(src_dir, fname))
+
+print(f"Total images: {len(all_image_paths)}")
+
+indices = np.arange(len(all_image_paths))
 train_idx, temp_idx = train_test_split(indices, test_size=0.4, random_state=RANDOM_STATE)
 val_idx,   test_idx = train_test_split(temp_idx, test_size=0.5, random_state=RANDOM_STATE)
 
-print(f"  Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
+print(f"\n✓ Split completed:")
+print(f"  Train: {len(train_idx)} images (60%)")
+print(f"  Val:   {len(val_idx)} images (20%)")
+print(f"  Test:  {len(test_idx)} images (20%)")
 
-def copy_and_resize(paths, dest_dir, img_size, desc):
+# ----------------------------------------------------------------
+# Augmentation helpers
+# ----------------------------------------------------------------
+AUG_ROTATION_MAX   = 10      # degrees, ± range for random rotation
+AUG_BRIGHTNESS_MIN = -20     # pixel offset lower bound
+AUG_BRIGHTNESS_MAX =  20     # pixel offset upper bound
+AUG_CONTRAST_MIN   = 0.8     # contrast scale lower bound
+AUG_CONTRAST_MAX   = 1.2     # contrast scale upper bound
+AUG_NOISE_STD_MIN  = 2.0     # Gaussian noise σ lower bound
+AUG_NOISE_STD_MAX  = 8.0     # Gaussian noise σ upper bound
+AUG_ELASTIC_SIGMA_MIN  = 2.0  # elastic deformation smoothness lower bound
+AUG_ELASTIC_SIGMA_MAX  = 4.0  # elastic deformation smoothness upper bound
+AUG_ELASTIC_ALPHA_MIN  = 8.0  # elastic deformation magnitude lower bound
+AUG_ELASTIC_ALPHA_MAX  = 16.0 # elastic deformation magnitude upper bound
+
+def augment_image(img):
+    """Apply random augmentations to a uint8 grayscale image."""
+    # Random rotation
+    if random.random() < 0.5:
+        angle = random.uniform(-AUG_ROTATION_MAX, AUG_ROTATION_MAX)
+        h, w  = img.shape
+        M     = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+        img   = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_REFLECT_101)
+
+    # Random brightness / contrast
+    if random.random() < 0.5:
+        alpha = random.uniform(AUG_CONTRAST_MIN, AUG_CONTRAST_MAX)
+        beta  = random.randint(AUG_BRIGHTNESS_MIN, AUG_BRIGHTNESS_MAX)
+        img   = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
+
+    # Random Gaussian noise
+    if random.random() < 0.5:
+        noise = np.random.normal(0, random.uniform(AUG_NOISE_STD_MIN, AUG_NOISE_STD_MAX),
+                                 img.shape).astype(np.float32)
+        img   = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    # Random elastic deformation
+    if random.random() < 0.3:
+        h, w     = img.shape
+        sigma    = random.uniform(AUG_ELASTIC_SIGMA_MIN, AUG_ELASTIC_SIGMA_MAX)
+        alpha_el = random.uniform(AUG_ELASTIC_ALPHA_MIN, AUG_ELASTIC_ALPHA_MAX)
+        dx = cv2.GaussianBlur(
+            (np.random.rand(h, w) * 2 - 1).astype(np.float32), (0, 0), sigma
+        ) * alpha_el
+        dy = cv2.GaussianBlur(
+            (np.random.rand(h, w) * 2 - 1).astype(np.float32), (0, 0), sigma
+        ) * alpha_el
+        x, y  = np.meshgrid(np.arange(w), np.arange(h))
+        map_x = np.clip(x + dx, 0, w - 1).astype(np.float32)
+        map_y = np.clip(y + dy, 0, h - 1).astype(np.float32)
+        img   = cv2.remap(img, map_x, map_y, cv2.INTER_CUBIC,
+                          borderMode=cv2.BORDER_REFLECT_101)
+    return img
+
+
+def upsample_and_save(src_paths, dest_dir, img_size, desc, augment=False):
+    """Upsample 28×28 images to img_size using INTER_CUBIC, with optional augmentation."""
     os.makedirs(dest_dir, exist_ok=True)
-    for i, p in enumerate(tqdm(paths, desc=desc)):
-        img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+    for idx, src in enumerate(tqdm(src_paths, desc=desc)):
+        img = cv2.imread(src, cv2.IMREAD_GRAYSCALE)
         if img is None:
             continue
+        if augment:
+            img = augment_image(img)
         img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_CUBIC)
-        out_name = f"{i:06d}_{os.path.basename(p)}"
-        cv2.imwrite(os.path.join(dest_dir, out_name), img)
+        # Normalize to [0, 255]
+        if img.max() <= 1.0:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+        cv2.imwrite(os.path.join(dest_dir, f"{idx:06d}_{os.path.basename(src)}"), img)
 
-copy_and_resize([all_paths[i] for i in train_idx], TRAIN_DIR, IMG_SIZE_GAN, "Copy train")
-copy_and_resize([all_paths[i] for i in val_idx],   VAL_DIR,   IMG_SIZE_GAN, "Copy val")
-copy_and_resize([all_paths[i] for i in test_idx],  TEST_DIR,  IMG_SIZE_GAN, "Copy test")
 
+# ----------------------------------------------------------------
+# [4/4] Write split directories (GAN size = 64×64)
+# ----------------------------------------------------------------
+print("\n[4/4] Creating split directories (upsampled to 64×64 for GAN)...")
+
+upsample_and_save([all_image_paths[i] for i in train_idx], TRAIN_DIR, IMG_SIZE_GAN,
+                  "Upsample train", augment=True)
+upsample_and_save([all_image_paths[i] for i in val_idx],   VAL_DIR,   IMG_SIZE_GAN,
+                  "Upsample val",   augment=False)
+upsample_and_save([all_image_paths[i] for i in test_idx],  TEST_DIR,  IMG_SIZE_GAN,
+                  "Upsample test",  augment=False)
+
+print("✓ Files written to split directories")
+
+# ----------------------------------------------------------------
 # Verify no overlap
+# ----------------------------------------------------------------
+print("\n" + "=" * 80)
+print("VERIFICATION – Confirming NO OVERLAP")
+print("=" * 80)
+
 train_files = set(os.listdir(TRAIN_DIR))
 val_files   = set(os.listdir(VAL_DIR))
 test_files  = set(os.listdir(TEST_DIR))
-assert len(train_files & val_files) == 0,   "Train/Val overlap!"
-assert len(train_files & test_files) == 0,  "Train/Test overlap!"
-assert len(val_files   & test_files) == 0,  "Val/Test overlap!"
-print("✓ No overlap verified")
+
+def _check_overlap(name_a, set_a, name_b, set_b):
+    """Print overlap count and assert zero overlap between two file sets."""
+    overlap = set_a & set_b
+    status  = "✓" if len(overlap) == 0 else "❌"
+    print(f"{name_a}-{name_b} overlap:  {len(overlap)} (should be 0) {status}")
+    assert len(overlap) == 0, f"{name_a}/{name_b} overlap!"
+
+_check_overlap("Train", train_files, "Val",  val_files)
+_check_overlap("Train", train_files, "Test", test_files)
+_check_overlap("Val",   val_files,   "Test", test_files)
+
+print("\n" + "=" * 80)
+print("✅ STEP 0 COMPLETE – Clean train/val/test split ready")
+print("=" * 80)
+print(f"\nData structure:")
+print(f"  Train: {TRAIN_DIR}")
+print(f"  Val:   {VAL_DIR}")
+print(f"  Test:  {TEST_DIR}")
 
 # ============================================================
 # GAN ARCHITECTURE  (exact copy from trial2.ipynb)
